@@ -1,0 +1,149 @@
+#!/bin/bash
+set -e -u # -x
+
+
+function prune_sanoid_snaps_once {
+    sanoid --verbose --prune-snapshots --force-update --configdir "$OUR_ETC_DIR"/sanoid
+}
+
+function prune_sanoid_snaps {
+    # Twice seems to be needed for some reason
+    prune_sanoid_snaps_once
+    prune_sanoid_snaps_once
+}
+
+
+OUR_DIR="$(dirname "$0")"
+OUR_ETC_DIR="$OUR_DIR"/../etc
+
+OUR_NAME="$(basename "$0")"
+OUR_SNAP_PREFIX="$OUR_NAME"
+
+# Load our configurable variables
+source "$OUR_ETC_DIR"/"$OUR_NAME".conf
+[ ${#SOURCES[@]} -gt 0 ]
+[ "$EXTERNAL_POOL" ]
+[ "$OFFSITE" ]
+[ "$OFFSITE_POOL" ]
+[ "$KEEP_BACKUP_SNAPS" -gt 0 ]
+
+declare -i FAIL_COUNT=0
+
+DO_EXTERNAL=true
+DO_OFFSITE=true
+if [ ${#@} -gt 0 ]; then
+    case "$1" in
+        external-only) DO_OFFSITE="" ;;
+        offsite-only) DO_EXTERNAL="" ;;
+        *) echo "error: unknown arg"; exit 1 ;;
+    esac
+fi
+
+DID_EXTERNAL_POOL_IMPORT="" # false
+
+
+function print-sep {
+    echo
+    echo "-----------------------------------------------------------------"
+}
+
+function say-will-do {
+    print-sep
+    echo "Will backup ${#SOURCES[@]} sources to $1 pool: $2"
+}
+
+
+function do-sources {
+    for SRC in "${SOURCES[@]}"; do
+        print-sep
+        echo "Doing $SRC"
+        DST="$1"/"${SRC#*/}" # replace first path component, i.e. the pool name
+        # Note: Always use --no-sync-snap because the syncoid snapshots aren't
+        # useful for syncing to multiple destinations, because after a first
+        # sync (which deletes the previous syncoid snap) the syncoid snaps of
+        # the source no longer match the next destination and so a next sync
+        # can't be done.
+        syncoid --recursive --no-sync-snap "$SRC" "$DST" \
+        || { FAIL_COUNT+=1; echo "FAILED: $SRC $DST !"; }
+    done
+}
+
+
+# Create our snapshots used by this script
+print-sep
+echo "Creating $OUR_SNAP_PREFIX snapshots"
+
+# Get timestamp, only once so it's guaranteed to be exactly the same for all.
+# Note: Always use UTC to ensure invariance of lexicographic sorting.
+LATEST_SNAP_DATE="$(date --utc +%Y-%m-%d_%H:%M:%S_%Z)"
+
+for SRC in "${SOURCES[@]}"; do
+    echo "Snapshotting $SRC"
+    zfs snapshot -r "$SRC"@"$OUR_SNAP_PREFIX"_"$LATEST_SNAP_DATE"
+done
+
+
+if [ "$DO_EXTERNAL" ]; then
+    say-will-do "external" "$EXTERNAL_POOL"
+
+    if ! zpool list "$EXTERNAL_POOL"; then
+        echo "Importing $EXTERNAL_POOL"
+        zpool import "$EXTERNAL_POOL"
+        DID_EXTERNAL_POOL_IMPORT=true
+    fi
+
+    # Prune any old sanoid snapshots from both source and destination
+    # prune_sanoid_snaps
+
+    do-sources "$EXTERNAL_POOL"
+
+    # Prune any sanoid snapshots that came from the source that don't match the
+    # destination policy
+    # prune_sanoid_snaps
+
+    if [ "$DID_EXTERNAL_POOL_IMPORT" ]; then
+        # Export to get rid of it, since this script imported it.
+        echo "Exporting $EXTERNAL_POOL"
+        zpool export "$EXTERNAL_POOL"
+    fi
+fi
+
+
+if [ "$DO_OFFSITE" ]; then
+    D="${OFFSITE}:${OFFSITE_POOL}"
+    say-will-do "offsite" "$D"
+    # prune_sanoid_snaps  # Prune any old sanoid snapshots from source
+    do-sources "$D"
+fi
+
+
+if [ $FAIL_COUNT -eq 0 -a "$DO_EXTERNAL" -a "$DO_OFFSITE" ] \
+   && zpool list "$EXTERNAL_POOL"
+then
+    print-sep
+    echo "Deleting old $OUR_SNAP_PREFIX snapshots; keeping newest $KEEP_BACKUP_SNAPS"
+    for SRC in "${SOURCES[@]}"; do
+        SNAPS=( $(zfs list -H -t snapshot -d 1 -o name -S name "$SRC") )
+        OUR_SNAPS=()
+        for S in "${SNAPS[@]}"; do
+            if [[ "$S" = "$SRC"@"$OUR_SNAP_PREFIX"_* ]]; then
+                OUR_SNAPS+=("$S")
+            fi
+        done
+        if [ ${#OUR_SNAPS[@]} -gt 0 ]; then
+            OLD_OUR_SNAPS=("${OUR_SNAPS[@]:KEEP_BACKUP_SNAPS}")
+            if [ ${#OLD_OUR_SNAPS[@]} -gt 0 ]; then
+                for S in "${OLD_OUR_SNAPS[@]}"; do
+                    echo "Deleting $S"
+                    zfs destroy -v -r "$S"
+                    NAME="${S#*/}"
+                    zfs destroy -v -r "$EXTERNAL_POOL"/"$NAME"
+                    ssh "$OFFSITE" "zfs destroy -v -r '$OFFSITE_POOL/$NAME'"
+                done
+            fi
+        fi
+    done
+fi
+
+
+exit $FAIL_COUNT
